@@ -8,6 +8,13 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const MODEL = 'llama-3.3-70b-versatile';
 
+// Seberapa sering nimbrung sendiri — 35 = 35% per pesan (naikin/turunin sesuai selera)
+const NIMBRUNG_CHANCE = 35;
+
+// Cooldown nimbrung per channel dalam menit — biar ga spam
+const NIMBRUNG_COOLDOWN_MENIT = 1;
+const nimbrungCooldown = new Map();
+
 const conversationHistory = new Map();
 const MAX_HISTORY = 10;
 
@@ -44,6 +51,14 @@ Aturan:
 - Ingat konteks percakapan sebelumnya.
 `.trim();
 
+// Prompt khusus waktu nimbrung sendiri (tanpa di-tag)
+const SYSTEM_PROMPT_NIMBRUNG = SYSTEM_PROMPT + `
+\nSEKARANG kamu lagi nimbrung sendiri ke percakapan tanpa ditanya.
+Respon harus singkat, natural, dan relevan sama pesan yang ada.
+Jangan mulai dengan sapaan formal. Langsung nimbrung aja kayak orang yang ikut ngobrol tiba-tiba.
+Kalau pesan terlalu random, ga jelas, atau ga ada yang menarik buat dikomentarin, balas dengan kata "skip" saja (tanpa tanda baca apapun).
+`;
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -72,12 +87,25 @@ function pushHistory(userId, role, content) {
     }
 }
 
-async function tanyaArachu(userId, pesanUser, namaUser) {
+function isCooldownAktif(channelId) {
+    const lastTime = nimbrungCooldown.get(channelId);
+    if (!lastTime) return false;
+    const selisihMenit = (Date.now() - lastTime) / 1000 / 60;
+    return selisihMenit < NIMBRUNG_COOLDOWN_MENIT;
+}
+
+function setCooldown(channelId) {
+    nimbrungCooldown.set(channelId, Date.now());
+}
+
+async function tanyaArachu(userId, pesanUser, namaUser, nimbrung = false) {
     pushHistory(userId, 'user', pesanUser);
     const history = getHistory(userId);
 
+    const systemPrompt = nimbrung ? SYSTEM_PROMPT_NIMBRUNG : SYSTEM_PROMPT;
+
     const messages = [
-        { role: 'system', content: SYSTEM_PROMPT + `\nNama user yang lagi ngobrol sama kamu adalah "${namaUser}".` },
+        { role: 'system', content: systemPrompt + `\nNama user yang lagi ngobrol sama kamu adalah "${namaUser}".` },
         ...history
     ];
 
@@ -87,8 +115,8 @@ async function tanyaArachu(userId, pesanUser, namaUser) {
             {
                 model: MODEL,
                 messages: messages,
-                max_tokens: 512,
-                temperature: 0.85
+                max_tokens: nimbrung ? 128 : 512,
+                temperature: 0.9
             },
             {
                 headers: {
@@ -122,41 +150,46 @@ client.on('messageCreate', async (message) => {
         } catch {}
     }
 
-    if (!diTag && !diReply) return;
-
-    // Ganti semua mention user jadi display name mereka
+    // Resolve mention jadi display name
     let isiPesan = message.content;
     for (const [id, user] of message.mentions.users) {
-        if (id === client.user.id) continue; // skip mention bot sendiri
+        if (id === client.user.id) continue;
         const member = message.guild?.members.cache.get(id);
         const nama = member?.displayName || user.displayName || user.username;
         isiPesan = isiPesan.replace(new RegExp(`<@!?${id}>`, 'g'), `@${nama}`);
     }
     isiPesan = isiPesan.replace(/<@!?\d+>/g, '').trim();
 
-    if (!isiPesan) {
-        return message.reply('ada apa?');
-    }
+    if (!isiPesan) return;
 
     const namaUser = message.member?.displayName || message.author.displayName || message.author.username;
 
-    try { await message.channel.sendTyping(); } catch {}
-
-    try {
-        const jawaban = await tanyaArachu(message.author.id, isiPesan, namaUser);
-
-        if (jawaban.length > 2000) {
-            const chunks = jawaban.match(/.{1,2000}/gs) || [];
-            for (const chunk of chunks) {
-                await message.reply(chunk);
+    // === MODE DI-TAG / DI-REPLY — selalu jawab ===
+    if (diTag || diReply) {
+        try { await message.channel.sendTyping(); } catch {}
+        try {
+            const jawaban = await tanyaArachu(message.author.id, isiPesan, namaUser, false);
+            if (jawaban.length > 2000) {
+                const chunks = jawaban.match(/.{1,2000}/gs) || [];
+                for (const chunk of chunks) await message.reply(chunk);
+            } else {
+                await message.reply(jawaban);
             }
-        } else {
-            await message.reply(jawaban);
+        } catch {
+            await message.reply('maaf, lagi error bentar 😅');
         }
+        return;
+    }
 
-    } catch (error) {
-        console.error('Error:', error.message);
-        await message.reply('maaf, lagi error bentar 😅');
+    // === MODE NIMBRUNG — aktif di SEMUA channel, tanpa filter ===
+    if (!isCooldownAktif(message.channel.id) && Math.random() * 100 < NIMBRUNG_CHANCE) {
+        setCooldown(message.channel.id);
+        try { await message.channel.sendTyping(); } catch {}
+        try {
+            const jawaban = await tanyaArachu(message.author.id, isiPesan, namaUser, true);
+            if (jawaban.toLowerCase().trim() === 'skip') return; // Arachu milih diam
+            await message.reply(jawaban);
+        } catch {}
     }
 });
 
